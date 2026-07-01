@@ -54,7 +54,7 @@ void loop() {
   
   // --- 2. 현재 조향각 읽기 ---
   int pot_value = analogRead(pot_pin); 
-  current_angle = map(pot_value, 470, 550, 60, 120); 
+  current_angle = map(pot_value, 550, 470, 60, 120); 
 
   // 🌟 [핵심 보완] 목표 각도와 현재 각도의 '오차(거리)' 계산
   int angle_error = abs(target_angle - current_angle);
