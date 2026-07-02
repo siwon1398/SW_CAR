@@ -12,7 +12,7 @@ int steer_left = 8;   // 조향 좌회전
 int pot_pin = A2;     // 가변 저항 핀 -> 확인필
 
 // --- 2. 속도 제어 변수 (★튜닝 구역: 0 ~ 255 사이로 조절★) ---
-int DRIVE_SPEED = 50; // 🚗 뒷바퀴 주행 속도 (초기 테스트용으로 느리게 설정)
+int DRIVE_SPEED = 150; // 🚗 뒷바퀴 주행 속도 (초기 테스트용으로 느리게 설정)
 int STEER_SPEED = 130; // ⚙️ 앞바퀴 조향 속도 (부드럽게 조향되도록 설정)
 
 int target_angle = 90;    
@@ -54,7 +54,7 @@ void loop() {
   
   // --- 2. 현재 조향각 읽기 ---
   int pot_value = analogRead(pot_pin); 
-  current_angle = map(pot_value, 550, 470, 60, 120); 
+  current_angle = map(pot_value, 555, 460, 60, 120); 
 
   // 🌟 [핵심 보완] 목표 각도와 현재 각도의 '오차(거리)' 계산
   int angle_error = abs(target_angle - current_angle);
