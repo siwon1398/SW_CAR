@@ -19,9 +19,9 @@ class Config:
 
     KP_ANGLE = 0.5
     KP_OFFSET = 0.6
-    STEER_MIN = 60
+    STEER_MIN = 70
     STEER_CENTER = 90
-    STEER_MAX = 120
+    STEER_MAX = 110
 
     # (HSV 필터링 변수 삭제됨)
 
