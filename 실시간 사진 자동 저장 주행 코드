@@ -1,0 +1,138 @@
+import numpy as np
+import cv2
+import Function_Library as fl
+import os
+import time
+
+class Config:
+    TARGET_LINE = 'RIGHT'
+    OFFSET_FROM_LINE = 180
+    LOOK_AHEAD = 80  
+    CURVE_PUSH_GAIN = 120  
+    KP_ANGLE = 0.5
+    KP_OFFSET = 0.6
+    STEER_MIN = 60
+    STEER_CENTER = 90
+    STEER_MAX = 120
+    SRC_POINTS = np.float32([[70, 230], [570, 230], [640, 360], [0, 360]])
+    N_WINDOWS = 9
+    MARGIN = 35
+    MIN_PIXELS = 40
+
+def get_steering_angle(camera, img, config):
+    img_h, img_w = img.shape[:2]
+    screen_center_x = img_w // 2
+    dst_points = np.float32([[0, 0], [img_w, 0], [img_w, img_h], [0, img_h]])
+    
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mask_contrast = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 51, -15)
+    thickness_kernel = np.ones((5, 5), np.uint8)
+    mask_thick_only = cv2.morphologyEx(mask_contrast, cv2.MORPH_OPEN, thickness_kernel)
+    vertical_kernel = np.ones((20, 2), np.uint8)
+    mask_no_horizontal = cv2.morphologyEx(mask_thick_only, cv2.MORPH_OPEN, vertical_kernel)
+    kernel = np.ones((30, 5), np.uint8)
+    closed_mask = cv2.morphologyEx(mask_no_horizontal, cv2.MORPH_CLOSE, kernel)
+    color_filtered = cv2.bitwise_and(img, img, mask=closed_mask)
+
+    gray_scale = camera.gray_conversion(color_filtered)
+    blurring = camera.gaussian_blurring(gray_scale, (7, 7))
+    edges = camera.canny_edge(blurring, 100, 200)
+
+    matrix = cv2.getPerspectiveTransform(config.SRC_POINTS, dst_points)
+    bev_img = cv2.warpPerspective(edges, matrix, (img_w, img_h))
+
+    histogram = np.sum(bev_img[img_h // 2:, :], axis=0)
+    midpoint = np.int64(histogram.shape[0] // 2)
+    right_x_base = np.argmax(histogram[midpoint:]) + midpoint
+
+    window_height = np.int64(img_h // config.N_WINDOWS)
+    nonzero = bev_img.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+    right_x_current = right_x_base
+    right_lane_inds = []
+
+    for window in range(config.N_WINDOWS):
+        win_y_low = img_h - (window + 1) * window_height
+        win_y_high = img_h - window * window_height
+        win_xright_low = right_x_current - config.MARGIN
+        win_xright_high = right_x_current + config.MARGIN
+        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                           (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+        right_lane_inds.append(good_right_inds)
+        if len(good_right_inds) > config.MIN_PIXELS:
+            right_x_current = np.int64(np.mean(nonzerox[good_right_inds]))
+
+    right_lane_inds = np.concatenate(right_lane_inds)
+    rightx, righty = nonzerox[right_lane_inds], nonzeroy[right_lane_inds]
+
+    final_steering = config.STEER_CENTER
+    y_eval = img_h - config.LOOK_AHEAD
+
+    if config.TARGET_LINE == 'RIGHT' and len(rightx) > 100:
+        right_fit = np.polyfit(righty, rightx, 2)
+        right_lane_x = right_fit[0] * y_eval ** 2 + right_fit[1] * y_eval + right_fit[2]
+        curve_factor = right_fit[1]
+        dynamic_offset = config.OFFSET_FROM_LINE + (abs(curve_factor) * config.CURVE_PUSH_GAIN)
+        target_center_x = right_lane_x - dynamic_offset
+        offset_error = target_center_x - screen_center_x
+        final_steering = config.STEER_CENTER + (offset_error * config.KP_OFFSET) - (curve_factor * config.KP_ANGLE * 100)
+
+    final_steering = max(config.STEER_MIN, min(config.STEER_MAX, int(final_steering)))
+    return final_steering
+
+def main():
+    arduino = fl.libARDUINO()
+    camera = fl.libCAMERA()
+    ser = arduino.init('COM5', 9600)
+    cap0, _ = camera.initial_setting(cam0port=1, capnum=1)
+
+    # 🌟 사진 저장용 폴더 자동 생성 로직
+    save_dir = "./dataset_raw"
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    is_driving = False
+    last_save_time = time.time()
+    img_counter = 0
+
+    print("=======================================")
+    print("데이터 수집 모드가 켜졌습니다. [s]를 누르면 주행하며 사진이 자동 저장됩니다.")
+    print("=======================================")
+
+    while True:
+        read_data = camera.camera_read(cap0)
+        ret, frame = read_data[0], read_data[1]
+        if not ret: break
+
+        # 원본 이미지 백업 (빨간 박스 그려지기 전 깨끗한 상태 보존)
+        raw_frame = frame.copy()
+
+        angle = get_steering_angle(camera, frame, Config)
+
+        # 🌟 주행 모드(DRIVING)일 때 0.5초마다 사진 자동 저장
+        if is_driving and (time.time() - last_save_time > 0.5):
+            img_name = os.path.join(save_dir, f"lane_{int(time.time())}_{img_counter}.jpg")
+            cv2.imwrite(img_name, raw_frame)
+            img_counter += 1
+            last_save_time = time.time()
+            print(f"📸 사진 저장 완료: {img_name} (총 {img_counter}장)")
+
+        camera.image_show(frame)
+
+        if ser is not None and ser.is_open:
+            if is_driving:
+                ser.write(f"A{angle}\n".encode('utf-8'))
+            else:
+                ser.write(b"S\n")
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): break
+        elif key == ord('s'): is_driving = not is_driving
+
+    cap0.release()
+    cv2.destroyAllWindows()
+    if ser is not None and ser.is_open: ser.close()
+
+if __name__ == "__main__":
+    main()
