@@ -1,0 +1,33 @@
+// --- 핀 설정 (기존 핀과 동일하게 설정) ---
+int pot_pin = A2;     // 가변 저항이 연결된 아날로그 핀
+int steer_right = 7;  // 안전을 위해 조향 모터 핀 선언만 해둠
+int steer_left = 8;   // 안전을 위해 조향 모터 핀 선언만 해둠
+
+void setup() {
+  // PC와의 시리얼 통신 시작 (주행 코드와 동일한 속도)
+  Serial.begin(9600);
+  
+  // 측정 중 모터가 마음대로 구동되지 않도록 출력 모드로 설정 후 0V 차단
+  pinMode(steer_right, OUTPUT);
+  pinMode(steer_left, OUTPUT);
+  analogWrite(steer_right, 0);
+  analogWrite(steer_left, 0);
+  
+  Serial.println("================================================");
+  Serial.println("조향 가변저항(A2) 값 측정 프로그램을 시작합니다.");
+  Serial.println("바퀴를 손으로 좌측 끝, 우측 끝으로 돌려보세요.");
+  Serial.println("================================================");
+  delay(1000);
+}
+
+void loop() {
+  // 1. 가변 저항의 아날로그 원시 값 읽기 (0 ~ 1023 사이)
+  int raw_pot_value = analogRead(pot_pin);
+  
+  // 2. 시리얼 모니터에 보기 좋게 출력
+  Serial.print("현재 가변저항 값 (Raw Value): ");
+  Serial.println(raw_pot_value);
+  
+  // 3. 너무 빨리 출력되면 보기 힘들므로 0.2초마다 갱신
+  delay(200);
+}
