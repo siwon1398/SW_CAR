@@ -12,9 +12,9 @@ import Function_Library as fl
 # ==========================================
 class Config:
     TARGET_LINE = 'RIGHT'
-    OFFSET_FROM_LINE = 180
+    OFFSET_FROM_LINE = 260
     LOOK_AHEAD = 80
-    CURVE_PUSH_GAIN = 120
+    CURVE_PUSH_GAIN = 125
 
     KP_ANGLE = 0.5
     KP_OFFSET = 0.6
