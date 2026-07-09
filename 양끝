@@ -59,7 +59,7 @@ void setup() {
   int pot_center_target = (pot_left_end + pot_right_end) / 2;
   // 중앙 근처로 이동 (간단화된 방식, 정밀 제어는 loop() 로직과 별개)
   while (abs(analogRead(pot_pin) - pot_center_target) > 5) {
-    if (analogRead(pot_pin) < pot_center_target) {
+    if (analogRead(pot_pin) > pot_center_target) {
       analogWrite(steer_right, STEER_SPEED);
       analogWrite(steer_left, 0);
     } else {
