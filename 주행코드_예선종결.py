@@ -16,7 +16,7 @@ class Config:
     # ------------------------------------------
     OFFSET_FROM_LINE = 210
     LOOK_AHEAD = 80
-    KP_ANGLE = 0.08
+    KP_ANGLE = 0.07
     KP_OFFSET = 0.2
 
     STEER_MIN = 70
