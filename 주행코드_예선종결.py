@@ -16,12 +16,16 @@ class Config:
     # ------------------------------------------
     OFFSET_FROM_LINE = 210
     LOOK_AHEAD = 80
-    KP_ANGLE = 0.07
+    KP_ANGLE = 0.05
     KP_OFFSET = 0.2
 
     STEER_MIN = 70
     STEER_CENTER = 90
     STEER_MAX = 110
+
+    # 🌟 [추가] 급우회전 감지 시 추가 오프셋 적용용 변수
+    RIGHT_CURVE_THRESHOLD = -0.05   # 이 값보다 작으면(더 음수면) 우회전으로 판단
+    RIGHT_CURVE_EXTRA_OFFSET = 30   # 우회전 판단 시 추가로 왼쪽으로 밀 픽셀값 (실측 후 조정 필요)
 
     # ------------------------------------------
     # 🗺️ 역투영(Top View) 사다리꼴 좌표 (버드아이뷰 변환용)
@@ -128,12 +132,21 @@ def get_steering_angle(camera, img, model, config):
 
     y_eval = img_h - config.LOOK_AHEAD
 
+    # 🌟 curve_factor 표시용 기본값 (차선 미검출 시에도 값이 존재하도록)
+    curve_factor_display = 0.0
+
     if len(rightx) > 100:
         right_fit = np.polyfit(righty, rightx, 2)
         right_lane_x = right_fit[0] * y_eval ** 2 + right_fit[1] * y_eval + right_fit[2]
 
         curve_factor = right_fit[1]
-        fixed_offset = config.OFFSET_FROM_LINE
+        curve_factor_display = curve_factor
+
+        # 🌟 [추가] 급우회전(curve_factor가 임계값보다 작을 때) 시 오프셋 증가
+        if curve_factor < config.RIGHT_CURVE_THRESHOLD:
+            fixed_offset = config.OFFSET_FROM_LINE + config.RIGHT_CURVE_EXTRA_OFFSET
+        else:
+            fixed_offset = config.OFFSET_FROM_LINE
 
         target_center_x = right_lane_x - fixed_offset
         offset_error = target_center_x - screen_center_x
@@ -149,9 +162,13 @@ def get_steering_angle(camera, img, model, config):
         cv2.putText(out_img, "Lane Lost! Keep PREV_STEER", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
     final_steering = max(config.STEER_MIN, min(config.STEER_MAX, int(final_steering)))
+
+    cv2.putText(out_img, f"Curve Factor: {curve_factor_display:.4f}", (10, img_h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
     cv2.imshow("Bird Eye View (Top View)", out_img)
 
-    return final_steering
+    return final_steering, curve_factor_display
 
 
 def main():
@@ -176,24 +193,8 @@ def main():
 
     cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    cv2.namedWindow('Trackbars')
-    cv2.resizeWindow('Trackbars', 400, 200)
-
-    default_top_w = int(Config.SRC_POINTS[1][0] - Config.SRC_POINTS[0][0])
-    default_bot_w = int(Config.SRC_POINTS[2][0] - Config.SRC_POINTS[3][0])
-    default_top_y = int(Config.SRC_POINTS[0][1])
-    default_bot_y = int(Config.SRC_POINTS[2][1])
-
-    cv2.createTrackbar('TOP_WIDTH', 'Trackbars', default_top_w, 640, lambda x: None)
-    cv2.createTrackbar('BOTTOM_WIDTH', 'Trackbars', default_bot_w, 640, lambda x: None)
-    cv2.createTrackbar('TOP_Y', 'Trackbars', default_top_y, 480, lambda x: None)
-    cv2.createTrackbar('BOTTOM_Y', 'Trackbars', default_bot_y, 480, lambda x: None)
-
     is_driving = False
 
-    # ==========================================
-    # 💡 [추가] 화면에 띄울 아두이노 상태 문자열 변수 초기화
-    # ==========================================
     calib_left_msg = "Calib Left: Wait..."
     calib_right_msg = "Calib Right: Wait..."
     realtime_pot_msg = "Pot: Wait..."
@@ -204,38 +205,16 @@ def main():
     print("=======================================")
 
     while True:
-        top_w = cv2.getTrackbarPos('TOP_WIDTH', 'Trackbars')
-        bot_w = cv2.getTrackbarPos('BOTTOM_WIDTH', 'Trackbars')
-        top_y = cv2.getTrackbarPos('TOP_Y', 'Trackbars')
-        bot_y = cv2.getTrackbarPos('BOTTOM_Y', 'Trackbars')
-
-        center_x = 320
-        tl_x = center_x - (top_w // 2)
-        tr_x = center_x + (top_w // 2)
-        bl_x = center_x - (bot_w // 2)
-        br_x = center_x + (bot_w // 2)
-
-        Config.SRC_POINTS = np.float32([
-            [tl_x, top_y],
-            [tr_x, top_y],
-            [br_x, bot_y],
-            [bl_x, bot_y]
-        ])
-
         read_data = camera.camera_read(cap0)
         ret, frame = read_data[0], read_data[1]
 
         if not ret:
             break
 
-        # ==========================================
-        # 💡 [추가] 아두이노에서 보내는 시리얼 데이터 수신 및 파싱
-        # ==========================================
         if ser is not None and ser.is_open:
             while ser.in_waiting > 0:
                 try:
                     line = ser.readline().decode('utf-8', errors='ignore').strip()
-                    # 터미널 프린트 대신 어떤 메시지인지 확인 후 각자의 변수에 저장합니다.
                     if "Calib Left" in line:
                         calib_left_msg = line
                     elif "Calib Right" in line:
@@ -245,8 +224,7 @@ def main():
                 except Exception:
                     pass
 
-        # 🧠 [변경] 기존 OpenCV 이미지 처리 대신 YOLOv8 추론 함수 호출
-        angle = get_steering_angle(camera, frame, model, Config)
+        angle, curve_factor = get_steering_angle(camera, frame, model, Config)
 
         status_text = "DRIVING!!" if is_driving else "STOPPED"
         color = (0, 0, 255) if is_driving else (0, 255, 255)
@@ -256,16 +234,13 @@ def main():
         cv2.putText(frame, f"Steering Angle: {angle}", (10, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        # ==========================================
-        # 💡 [추가] 아두이노 값 화면(OpenCV)에 텍스트로 표시
-        # ==========================================
-        # 1. 실시간 가변저항값 (하늘색)
+        cv2.putText(frame, f"Curve Factor: {curve_factor:.4f}", (10, 220),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
         cv2.putText(frame, realtime_pot_msg, (10, 110),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-        # 2. 왼쪽 캘리브레이션 값 (노란색)
         cv2.putText(frame, calib_left_msg, (10, 150),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        # 3. 오른쪽 캘리브레이션 값 (노란색)
         cv2.putText(frame, calib_right_msg, (10, 180),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
@@ -288,10 +263,8 @@ def main():
         elif key == ord('p'):
             print("\n[현재 사다리꼴 좌표(SRC_POINTS)]")
             print("    SRC_POINTS = np.float32([")
-            print(f"        [{tl_x}, {top_y}],")
-            print(f"        [{tr_x}, {top_y}],")
-            print(f"        [{br_x}, {bot_y}],")
-            print(f"        [{bl_x}, {bot_y}]")
+            for pt in Config.SRC_POINTS:
+                print(f"        [{int(pt[0])}, {int(pt[1])}],")
             print("    ])\n")
 
     cap0.release()
