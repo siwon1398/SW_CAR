@@ -9,17 +9,17 @@ int steer_left = 8;
 int pot_pin = A2;
 
 // --- 2. 속도 제어 변수 ---
-int DRIVE_SPEED = 170;
+int DRIVE_SPEED = 255;
 int STEER_SPEED = 150;   // 캘리브레이션(끝까지 이동) 시 사용
 
 int target_angle = 90;
 int current_angle = 90;
-int error_margin = 4;
+int error_margin = 1;
 
 // [추가] 좌우 끝값 캘리브레이션 변수
 int pot_left_end = 0;    // 왼쪽 끝까지 돌렸을 때의 pot 값
 int pot_right_end = 0;   // 오른쪽 끝까지 돌렸을 때의 pot 값
-const unsigned long CALIB_MOVE_TIME = 2000; // 끝까지 이동에 걸리는 시간 (ms, 실측 후 조정 필요)
+const unsigned long CALIB_MOVE_TIME = 3000; // 끝까지 이동에 걸리는 시간 (ms, 실측 후 조정 필요)
 
 void setup() {
   Serial.begin(9600);
@@ -104,7 +104,7 @@ void loop() {
 
   // --- 오차 기반 동적 속도 계산 ---
   int angle_error = abs(target_angle - current_angle);
-  int dynamic_steer_speed = map(angle_error, 0, 30, 50, 130);
+  int dynamic_steer_speed = map(angle_error, 0, 30, 60, 130);
   dynamic_steer_speed = constrain(dynamic_steer_speed, 50, 130);
 
   // --- 조향 모터 작동 로직 ---
