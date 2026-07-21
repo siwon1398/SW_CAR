@@ -1,0 +1,980 @@
+import threading
+import time
+import cv2
+import numpy as np
+import Function_Library as fl
+from serial.tools import list_ports  # [DEBUG] 연결 실패 시 사용 가능한 포트 목록 출력용
+from PIL import Image, ImageDraw, ImageFont  # [DEBUG] cv2.putText는 한글을 지원하지 않아 PIL로 렌더링
+
+# ==========================================
+# 🛠️ [설정] 주차 미션 파라미터
+# 아직 더 생각해볼거: 평형과 우측과의 거리의 비율조정, 왼쪽시작과 오른쪽시작일때를 나눌지
+class Config:
+    # True면 각 상태가 시간(DURATION)으로 자동 전환되지 않고, 'n' 키를 눌러야 다음
+    # 상태로 넘어감. 이때 콘솔에 "이 상태에 머문 시간"을 출력해줌
+    DEBUG_STEP_MODE = False
+
+    # --- 하드웨어 포트 ---
+    ARDUINO_PORT = 'COM10'
+    BAUD_RATE = 9600
+    LIDAR_PORT = 'COM9'
+
+    # --- 조향 스펙 (주행코드와 동일) ---
+    STEER_MIN = 70      # 좌측 최대
+    STEER_CENTER = 90   # 중앙
+    STEER_MAX = 110     # 우측 최대
+
+    # --- [PARK] 우측면 라이다 감시 영역 ---
+    RIGHT_SIDE_MIN_ANGLE = 240
+    RIGHT_SIDE_MAX_ANGLE = 285
+    # 주차된 차량까지의 예상 거리 범위 (mm) - 트랙에서 실측 후 조정
+    RIGHT_SIDE_MIN_DIST = 150
+    RIGHT_SIDE_MAX_DIST = 1500
+    # 이 개수 이상 포인트가 잡혀야 "차량 있음"으로 인정 (노이즈 방어)
+    RIGHT_OCC_MIN_POINTS = 3
+    # 상태(있음/없음)가 이 프레임 수만큼 연속되어야 전환 인정 (깜빡임 방어)
+    DEBOUNCE_FRAMES = 3
+
+    # 우측 앞/뒤 센서 거리 차이가 이 값(cm) 이하면 "평행"으로 표시
+    PARALLEL_DIFF_MARGIN_CM = 3.0
+    # 뒤 모서리 센서가 이 거리(cm) 이하로 잡으면 "위험" 경고 표시
+    CORNER_DANGER_CM = 10
+    # 초음파 편차당 조향 보정 비례 게인 (1cm 편차당 3.0도 보정)
+    PARALLEL_KP = 1.5
+    # 주차 정렬 불량 시 최대 허용하는 수정 주행 횟수 (무한 루프 방지)
+    MAX_ADJUST_LIMIT = 5
+
+    # --- [PARK-US] 전진 거리 유지 주행 (Wall Following) 설정 ---
+    DESIRED_WALL_DIST_CM = 50.0       # 옆 차량과의 이상적인 목표 간격 (cm)
+    DESIRED_WALL_DIST_MARGIN_CM = 15.0 # 주차 안착 성공을 판정하는 우측 목표 거리 허용 오차 마진 (cm)
+    WALL_DIST_KP = 1.5              # 목표 거리 편차당 조향 보정 비례 게인
+
+    # --- [PARK-LIDAR-STOP] 라이다 기반 좌우 양옆 차량 감지 후진 자동정지 설정 ---
+    LIDAR_STOP_DETECT_ENABLE = True
+    LIDAR_STOP_MIN_ANGLE_R = 265
+    LIDAR_STOP_MAX_ANGLE_R = 285
+    LIDAR_STOP_MIN_ANGLE_L = 75
+    LIDAR_STOP_MAX_ANGLE_L = 95
+    LIDAR_STOP_MAX_DIST = 1000        # 양옆 차량이 감지되는 최대 거리 (mm)
+    LIDAR_STOP_MIN_POINTS = 3
+    REV_STRAIGHT_SAFE_TIME = 0.5      # 후진 기동 시작 후 라이다 감지 유예 안전 시간 (초)
+
+    # --- [PARK] 시간 기반 기동 및 정차 파라미터 (⚠️ 전부 실측 튜닝 필수 초기값) ---
+    ALIGN_FWD_DURATION = 1.15    # 빈 칸 감지 후 추가 전진 시간 (차체-칸 정렬용)
+    LEFT_FWD_DURATION = 3.5     # 좌로 꺾어 전진하는 시간 (진입 각도 만들기)
+
+    # 🛑 [정차 및 정지 딜레이 관련 변수 일괄 정리]
+    REV_RIGHT_PREP_DURATION = 0.5    # 좌회전 완료 후 후진 기어 넣기 전 대기 시간 (정차)
+    REV_STRAIGHT_PREP_DURATION = 0.5 # 수정 전진 후 재후진 기어 넣기 전 대기 시간 (정차)
+    GEAR_REVERSE_DELAY = 0.3         # 후진에서 전진으로 기어 역전 시 하드웨어 보호 물리 대기 시간 (초)
+    PARKED_WAIT = 4.0                # 주차 성공 완료 후 제자리 정차 시간 (규칙: 3~5초)
+    EXIT_FWD_PREP_DURATION = 1.0     # 출차 전 똑바로 살짝 직진 전진하며 대기하는 시간
+
+    REV_RIGHT_DURATION = 4.5    # 우로 꺾어 후진하는 시간 (칸으로 진입)
+    REV_STRAIGHT_DURATION = 1.5 # 핸들 중앙, 직진 후진 시간 (칸 안 깊숙이 정렬 후진)
+    PARK_ADJUST_FWD_DURATION = 1.2 # 주차 삐딱할 때 정렬하며 앞으로 살짝 전진하는 시간
+    EXIT_TURN_DURATION = 6.0    # 우로 꺾어 빠져나오는 시간
+    EXIT_STRAIGHT_DURATION = 6.0  # OUT 방향 직진 시간 (앞바퀴가 OUT 라인 밟도록)
+
+    # --- 전체 미션 제한 시간 (규칙: 4분) ---
+    MISSION_TIMEOUT = 240.0
+# ==========================================
+# [PARK] 비동기 라이다 리더 (주행코드의 LidarStream 구조 재사용)
+
+class LidarStream:
+    def __init__(self, lidar_lib, port):
+        self.lidar_lib = lidar_lib
+        self.port = port
+        self.lidar = None
+        self.current_scan = None
+        self.started = False
+        self.read_lock = threading.Lock()
+        self.thread = None
+
+    def start(self):
+        if self.started:
+            return self
+        try:
+            self.lidar = self.lidar_lib(self.port)
+            self.lidar.init()
+            self.lidar.getState()
+            self.started = True
+            self.thread = threading.Thread(target=self.update, args=())
+            self.thread.daemon = True
+            self.thread.start()
+            print(f"라이다 스레드 시작. 포트: {self.port}")
+        except Exception as e:
+            print(f"라이다 초기화 에러: {e}")
+            self.started = False
+        return self
+
+    def update(self):
+        try:
+            for scan in self.lidar.scanning():
+                if not self.started:
+                    break
+                with self.read_lock:
+                    self.current_scan = scan.copy()
+                time.sleep(0.02)
+        except Exception as e:
+            print(f"라이다 수집 오류: {e}")
+            self.started = False
+
+    def read(self):
+        with self.read_lock:
+            return self.current_scan
+
+    def release(self):
+        self.started = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join()
+        if self.lidar is not None:
+            try:
+                self.lidar.stop()
+                print("라이다 종료 완료.")
+            except Exception as e:
+                print(f"라이다 중지 에러: {e}")
+
+
+# ==========================================
+# [PARK] 우측면 차량 존재 여부 판단
+
+def right_side_occupied(lidar_obj, scan, config): #오른쪽에 있는지 확인하는 함수
+    """우측면 각도/거리 범위 안의 포인트 수로 차량 존재를 판단.
+    반환: (있음 여부, 포인트 개수, 최근접 포인트 각도, 최근접 포인트 거리mm, 필터링된 포인트 배열)
+    최근접 포인트가 없으면 각도/거리는 None."""
+    pts = lidar_obj.getAngleDistanceRange(
+        scan,
+        config.RIGHT_SIDE_MIN_ANGLE, config.RIGHT_SIDE_MAX_ANGLE,
+        config.RIGHT_SIDE_MIN_DIST, config.RIGHT_SIDE_MAX_DIST
+    )
+    if len(pts) > 0:
+        closest_idx = np.argmin(pts[:, 1])
+        closest_angle = float(pts[closest_idx, 0])
+        closest_dist = float(pts[closest_idx, 1])
+    else:
+        closest_angle, closest_dist = None, None
+    return len(pts) >= config.RIGHT_OCC_MIN_POINTS, len(pts), closest_angle, closest_dist, pts
+
+
+# 중복 명령 전송 방지 및 유실 복구용 전역 변수
+last_sent_cmd = ""
+last_sent_time = 0.0
+
+def send_cmd(ser, cmd): #cmd를 보내는함수
+    global last_sent_cmd, last_sent_time
+    if ser is not None and ser.is_open:
+        now = time.time()
+        # 동일한 명령이면서 마지막 송신 후 300ms(0.30초)가 지나지 않았다면 송신을 스킵합니다.
+        # (유실 복구 및 상태 동기화를 위해 300ms마다 주기적으로 재송신 실행)
+        if cmd == last_sent_cmd and (now - last_sent_time) < 0.30:
+            return
+        ser.write(cmd.encode('utf-8'))
+        ser.flush()  # OS 버퍼를 비우고 아두이노로 즉각 물리적 송신 보장
+        last_sent_cmd = cmd
+        last_sent_time = now
+
+
+# ==========================================
+# [DEBUG/PARK-US] 아두이노 시리얼 데이터 일괄 읽기 (조향각 및 초음파)
+# ==========================================
+def read_serial_data(ser, last_angle, last_us, last_calib_l, last_calib_r, last_pot):
+    """
+    아두이노 시리얼 버퍼에서 들어오는 모든 라인을 소비하며 조향각, 초음파, 가변저항 데이터를 일괄 업데이트.
+    """
+    if ser is None or not ser.is_open:
+        return last_angle, last_us, last_calib_l, last_calib_r, last_pot
+    latest_angle = last_angle
+    latest_us = dict(last_us)
+    latest_calib_l = last_calib_l
+    latest_calib_r = last_calib_r
+    latest_pot = last_pot
+    try:
+        while ser.in_waiting > 0:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if not line:
+                continue
+            # 1. 캘리브레이션 값 파싱
+            if "Calib Left:" in line:
+                try:
+                    latest_calib_l = int(line.split("Calib Left:")[1].strip())
+                except ValueError:
+                    pass
+            elif "Calib Right:" in line:
+                try:
+                    latest_calib_r = int(line.split("Calib Right:")[1].strip())
+                except ValueError:
+                    pass
+            # 2. 실시간 Pot 및 각도 파싱
+            elif "Pot:" in line:
+                try:
+                    parts = line.split("|")
+                    latest_pot = int(parts[0].split("Pot:")[1].strip())
+                    if "Cur Ang:" in parts[1]:
+                        latest_angle = int(parts[1].split("Cur Ang:")[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            # 3. 초음파 거리 응답 처리 (US: RF=120 RR=118 CL=45 CR=200 형식)
+            elif line.startswith("US:"):
+                try:
+                    parts = line[3:].strip().split()
+                    parsed = {}
+                    for p in parts:
+                        key, val = p.split('=')
+                        val = int(val)
+                        parsed[key] = None if val < 0 else val
+                    latest_us.update(parsed)
+                except (ValueError, IndexError):
+                    pass
+    except Exception:
+        pass
+    return latest_angle, latest_us, latest_calib_l, latest_calib_r, latest_pot
+
+
+
+
+# ==========================================
+# [PARK-US] 전진 거리 유지 주행 (Wall/Car Following) 조향각 연산 함수
+# ==========================================
+def get_wall_following_steer(us_readings, config):
+    # 옆차와 거리로 중앙에 들어가게 하면서 평행도 위와같은 방식으로 맞추는 함수
+    rf = us_readings.get('RF')
+    rr = us_readings.get('RR')
+    if rf is not None and rr is not None:
+        current_dist = (rf + rr) / 2.0
+        dist_error = current_dist - config.DESIRED_WALL_DIST_CM
+        angle_error = rf - rr
+
+        # 거리 오차 보정 조향 + 평행 오차 보정 조향 결합
+        steer_offset = int((dist_error * config.WALL_DIST_KP) + (angle_error * config.PARALLEL_KP))
+        target_steer = config.STEER_CENTER + steer_offset
+        return max(min(target_steer, config.STEER_MAX), config.STEER_MIN)
+    return config.STEER_CENTER
+
+
+# ==========================================
+# [PARK-LIDAR-STOP] 라이다 기반 좌우 양옆 차량 감지 후진 자동정지 판정 함수
+# ==========================================
+def should_stop_by_lidar_both_sides(scan, config):
+    """
+    라이다 데이터를 이용하여 차량의 좌측(75~95도) 및 우측(265~285도) 양쪽에
+    지정된 거리(LIDAR_STOP_MAX_DIST) 이내로 차량 모서리가 동시에 포착되는지 감지합니다.
+    """
+    if scan is None:
+        return False
+    pts = np.array(scan)
+    if len(pts) == 0:
+        return False
+
+    # 1. 우측 차량 감지 검사 (265~285도)
+    r_cond = np.where(
+        (pts[:, 0] >= config.LIDAR_STOP_MIN_ANGLE_R) &
+        (pts[:, 0] <= config.LIDAR_STOP_MAX_ANGLE_R) &
+        (pts[:, 1] >= 150) &  # 초근접 노이즈 제외
+        (pts[:, 1] <= config.LIDAR_STOP_MAX_DIST)
+    )
+    # 2. 좌측 차량 감지 검사 (75~95도)
+    l_cond = np.where(
+        (pts[:, 0] >= config.LIDAR_STOP_MIN_ANGLE_L) &
+        (pts[:, 0] <= config.LIDAR_STOP_MAX_ANGLE_L) &
+        (pts[:, 1] >= 150) &  # 초근접 노이즈 제외
+        (pts[:, 1] <= config.LIDAR_STOP_MAX_DIST)
+    )
+
+    return len(pts[r_cond]) >= config.LIDAR_STOP_MIN_POINTS and len(pts[l_cond]) >= config.LIDAR_STOP_MIN_POINTS
+
+
+# ==========================================
+# [DEBUG] 현재 연결 가능한 COM 포트 목록 출력
+# ==========================================
+def print_available_ports(): #아두이노나 라이더 연결실패시 com포트 함수
+    ports = list(list_ports.comports())
+    if not ports:
+        print("[DEBUG] 인식된 COM 포트가 없습니다. 케이블/드라이버를 확인하세요.")
+        return
+    print("[DEBUG] 현재 연결된 COM 포트 목록:")
+    for p in ports:
+        print(f"    - {p.device} : {p.description}")
+
+
+# ==========================================
+# [DEBUG] 상태별 사람이 읽을 수 있는 설명 (화면 표시용)
+# 형식: 상태명 -> (한글 설명, 동작 종류, 표시 색상 BGR)
+# ==========================================
+STATE_INFO = {
+    'IDLE':          ("대기 중",         "정지",         (180, 180, 180)),
+    'SCAN_FIRST':    ("첫 차량 탐색",     "전진 · 직진",   (0, 255, 0)),
+    'SCAN_GAP':      ("빈 칸 탐색",       "전진 · 직진",   (0, 255, 0)),
+    'ALIGN_FWD':     ("정렬 전진",        "전진 · 직진",   (0, 255, 0)),
+    'LEFT_FWD':      ("진입각 만들기",    "전진 · 좌회전", (0, 255, 255)),
+    'REV_RIGHT_PREP': ("후진 선회 대기",    "정지 · 우조향", (0, 200, 255)),
+    'REV_RIGHT':     ("칸 진입 후진",     "후진 · 우회전", (0, 140, 255)),
+    'REV_STRAIGHT':  ("칸 안 정렬 후진",   "후진 · 직진",   (0, 140, 255)),
+    'REV_STRAIGHT_ADJUST': ("수정 전진 정렬", "전진 · 보정조향", (0, 200, 255)),
+    'REV_STRAIGHT_PREP': ("재후진 대기",     "정지 · 직진",   (0, 200, 255)),
+    'PARKED':        ("정차 중",         "정지",         (255, 200, 0)),
+    'EXIT_FWD_PREP': ("출차 직진 전진",   "전진 · 직진",   (0, 255, 0)),
+    'EXIT_TURN':     ("출차 우회전",      "전진 · 우회전", (0, 255, 255)),
+    'EXIT_STRAIGHT': ("OUT 방향 이동",   "전진 · 직진",   (0, 255, 0)),
+    'DONE':          ("미션 종료",       "정지",         (180, 180, 180)),
+}
+
+# [DEBUG] 상태별로 이번에 보내는 목표 조향각 (없으면 None = 정지 상태라 조향 목표 없음)
+TARGET_ANGLE_BY_STATE = {
+    'SCAN_FIRST':    Config.STEER_CENTER,
+    'SCAN_GAP':      Config.STEER_CENTER,
+    'ALIGN_FWD':     Config.STEER_CENTER,
+    'LEFT_FWD':      Config.STEER_MIN,
+    'REV_RIGHT_PREP': Config.STEER_MAX,
+    'REV_RIGHT':     Config.STEER_MAX,
+    'REV_STRAIGHT':  Config.STEER_CENTER,
+    'REV_STRAIGHT_ADJUST': None,         # 매 루프마다 동적으로 조향각을 연산함
+    'REV_STRAIGHT_PREP': Config.STEER_CENTER,
+    'EXIT_FWD_PREP': Config.STEER_CENTER,
+    'EXIT_TURN':     Config.STEER_MAX,
+    'EXIT_STRAIGHT': Config.STEER_CENTER,
+}
+
+# ==========================================
+# [DEBUG] 한글 폰트 로드 (cv2.putText는 한글 미지원 → PIL로 대체)
+# ==========================================
+_KR_FONT_CANDIDATES = [
+    "C:/Windows/Fonts/malgun.ttf",   # 맑은 고딕 (Windows 기본, 가장 흔함)
+    "C:/Windows/Fonts/malgunbd.ttf",
+    "C:/Windows/Fonts/gulim.ttc",
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",  # 혹시 리눅스 환경일 경우
+]
+_kr_font_cache = {}
+
+
+def _get_kr_font(size):
+    if size in _kr_font_cache:
+        return _kr_font_cache[size]
+    for path in _KR_FONT_CANDIDATES:
+        try:
+            font = ImageFont.truetype(path, size)
+            _kr_font_cache[size] = font
+            return font
+        except OSError:
+            continue
+    # 한글 폰트를 하나도 못 찾은 경우 (실행 시 한 번만 경고 출력)
+    if size not in _kr_font_cache:
+        print("[DEBUG] 한글 폰트를 찾지 못했습니다. 화면에 한글이 깨질 수 있습니다. "
+              "(C:/Windows/Fonts 경로에 malgun.ttf가 있는지 확인)")
+    font = ImageFont.load_default()
+    _kr_font_cache[size] = font
+    return font
+
+
+def put_text_kr(canvas_bgr, text, org, size, color_bgr):
+    """cv2.putText 대체: 한글이 포함된 문자열도 정상 렌더링."""
+    img_pil = Image.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    font = _get_kr_font(size)
+    color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+    draw.text(org, text, font=font, fill=color_rgb)
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+
+# ==========================================
+# [DEBUG] 라이다 전체 스캔 레이더 시각화
+# ==========================================
+_RADAR_SIZE = 420
+_RADAR_MAX_RANGE = 1500  # mm, 화면에 표시할 최대 거리 (이보다 먼 포인트는 가장자리에 clamp)
+
+
+def _polar_to_xy(angle_deg, dist_mm, center, radius_px, max_range):
+    # 몇도에 얼마 떨어진걸 그림판에 대응시키는 함수
+    theta = np.radians(angle_deg - 90)
+    r = min(dist_mm / max_range, 1.0) * radius_px
+    x = int(center[0] + r * np.cos(theta))
+    y = int(center[1] + r * np.sin(theta))
+    return x, y
+
+
+def draw_radar(scan, config):
+    #라이다 전체 스캔을 원형 그래프로 그리는 함수
+    img = np.zeros((_RADAR_SIZE, _RADAR_SIZE, 3), dtype=np.uint8)
+    center = (_RADAR_SIZE // 2, _RADAR_SIZE // 2)
+    radius_px = _RADAR_SIZE // 2 - 55
+
+    # 거리 참고선 (원 3개) + 각 원의 실제 거리(mm) 라벨
+    # 라벨은 90도 방향(화면상 3시 방향, 정면선/감시구역과 안 겹치는 자리)에 배치
+    for frac in (0.33, 0.66, 1.0):
+        r = int(radius_px * frac)
+        cv2.circle(img, center, r, (55, 55, 55), 1)
+        lx, ly = _polar_to_xy(90, frac * _RADAR_MAX_RANGE, center, radius_px, _RADAR_MAX_RANGE)
+        img = put_text_kr(img, f"{frac * _RADAR_MAX_RANGE:.0f}mm", (lx + 4, ly - 8), 12, (130, 130, 130))
+
+    # [NEW] 원 바깥쪽에 45도 간격 각도 눈금
+    for ang in range(0, 360, 45):
+        theta = np.radians(ang - 90)
+        tick_r = radius_px + 16
+        tx = int(center[0] + tick_r * np.cos(theta))
+        ty = int(center[1] + tick_r * np.sin(theta))
+        # 텍스트가 화면 밖으로 안 나가도록 위치 보정 (대략적인 텍스트 폭/높이 감안)
+        tx = min(max(tx - 14, 0), _RADAR_SIZE - 34)
+        ty = min(max(ty - 8, 0), _RADAR_SIZE - 18)
+        tick_color = (0, 90, 255) if ang == 180 else (150, 150, 150)  # 정면(180도)만 강조
+        img = put_text_kr(img, f"{ang}°", (tx, ty), 13, tick_color)
+
+    # 우측 감시구역 부채꼴 (반투명하게 보이도록 얇은 선으로 경계만 표시)
+    zone_pts = [center]
+    for a in np.linspace(config.RIGHT_SIDE_MIN_ANGLE, config.RIGHT_SIDE_MAX_ANGLE, 20):
+        zone_pts.append(_polar_to_xy(a, _RADAR_MAX_RANGE, center, radius_px, _RADAR_MAX_RANGE))
+    zone_pts = np.array(zone_pts, dtype=np.int32)
+    overlay = img.copy()
+    cv2.fillPoly(overlay, [zone_pts], (0, 70, 110))
+    img = cv2.addWeighted(overlay, 0.4, img, 0.6, 0)
+
+    # 정면(180도) 기준선 — 확인된 사실
+    fx, fy = _polar_to_xy(180, _RADAR_MAX_RANGE, center, radius_px, _RADAR_MAX_RANGE)
+    cv2.line(img, center, (fx, fy), (0, 90, 255), 2)
+
+    # 차량 위치(중심) 표시
+    cv2.circle(img, center, 5, (255, 255, 255), -1)
+
+    # 스캔 포인트 찍기 + 감시구역 안 최근접 포인트 추적
+    closest_zone_pt = None  # (x, y, angle, dist)
+    if scan is not None:
+        pts = np.array(scan)
+        if len(pts) > 0:
+            for angle, dist in pts:
+                if dist <= 0:
+                    continue
+                in_zone = config.RIGHT_SIDE_MIN_ANGLE <= angle <= config.RIGHT_SIDE_MAX_ANGLE
+                in_dist = config.RIGHT_SIDE_MIN_DIST <= dist <= config.RIGHT_SIDE_MAX_DIST
+                if in_zone and in_dist:
+                    color = (0, 165, 255)  # 우측 감시구역 + 거리조건까지 만족 (실제 판정에 쓰이는 포인트)
+                elif in_zone:
+                    color = (0, 255, 255)  # 각도는 구역 안이지만 거리조건 밖 (너무 가깝거나 멂)
+                else:
+                    color = (0, 200, 0)    # 구역 밖
+                x, y = _polar_to_xy(angle, dist, center, radius_px, _RADAR_MAX_RANGE)
+                cv2.circle(img, (x, y), 2, color, -1)
+
+                # [NEW] 판정에 실제로 쓰이는(주황) 포인트 중 최근접만 따로 기억
+                if in_zone and in_dist:
+                    if closest_zone_pt is None or dist < closest_zone_pt[3]:
+                        closest_zone_pt = (x, y, angle, dist)
+
+    # [NEW] 감시구역 최근접 포인트 각도/거리 숫자 표시
+    if closest_zone_pt is not None:
+        px, py, p_angle, p_dist = closest_zone_pt
+        cv2.circle(img, (px, py), 5, (255, 255, 255), 1)  # 강조 테두리
+        label_x = min(max(px + 8, 0), _RADAR_SIZE - 100)
+        label_y = min(max(py - 8, 0), _RADAR_SIZE - 16)
+        img = put_text_kr(img, f"{p_angle:.0f}° {p_dist:.0f}mm", (label_x, label_y), 15, (255, 255, 255))
+
+    # 라벨 (정면 각도 라벨은 위쪽 각도 눈금에서 이미 강조 표시되므로 화살표 옆 중복 라벨은 생략)
+    img = put_text_kr(img, f"우측감시 {config.RIGHT_SIDE_MIN_ANGLE}~{config.RIGHT_SIDE_MAX_ANGLE}°",
+                       (5, _RADAR_SIZE - 40), 14, (0, 165, 255))
+    img = put_text_kr(img, f"표시 최대거리 {_RADAR_MAX_RANGE}mm", (5, _RADAR_SIZE - 20), 13, (150, 150, 150))
+    return img
+
+
+# ==========================================
+# [PARK-US] 초음파 4개 실시간 디버그 시각화 (차량 상단뷰)
+# ==========================================
+_US_CANVAS_W, _US_CANVAS_H = 480, 340
+_US_SCALE_PX_PER_CM = 2.2   # 거리 → 선 길이 변환 배율 (화면 표시용 스케일, 실측 검증 안 됨)
+_US_MAX_LINE_CM = 120       # 이보다 먼 거리는 선 길이를 이 값으로 고정(clamp), 숫자 자체는 실측값 그대로 표시
+
+# 차체 사각형 (앞이 위, 뒤가 아래)
+_US_CAR_LEFT, _US_CAR_RIGHT = 170, 260
+_US_CAR_TOP, _US_CAR_BOTTOM = 40, 260
+
+# 센서 위치 및 뻗어나가는 방향(단위 벡터)
+_US_SENSOR_LAYOUT = {
+    'RF': {'pos': (_US_CAR_RIGHT, 100), 'dir': (1.0, 0.0),   'label': '우측앞(RF)'},
+    'RR': {'pos': (_US_CAR_RIGHT, 200), 'dir': (1.0, 0.0),   'label': '우측뒤(RR)'},
+    'CL': {'pos': (_US_CAR_LEFT, _US_CAR_BOTTOM), 'dir': (-0.7, 0.7), 'label': '왼쪽모서리(CL)'},
+    'CR': {'pos': (_US_CAR_RIGHT, _US_CAR_BOTTOM), 'dir': (0.7, 0.7), 'label': '오른쪽모서리(CR)'},
+}
+
+
+def draw_ultrasonic_debug(us_readings, config):
+    #초음파 감지 창 띄우는 함수
+    img = np.zeros((_US_CANVAS_H, _US_CANVAS_W, 3), dtype=np.uint8)
+
+    # 차체 윤곽
+    cv2.rectangle(img, (_US_CAR_LEFT, _US_CAR_TOP), (_US_CAR_RIGHT, _US_CAR_BOTTOM), (90, 90, 90), 2)
+    img = put_text_kr(img, "앞", (_US_CAR_LEFT + 35, _US_CAR_TOP - 24), 14, (150, 150, 150))
+    img = put_text_kr(img, "뒤", (_US_CAR_LEFT + 35, _US_CAR_BOTTOM + 4), 14, (150, 150, 150))
+
+    for key, layout in _US_SENSOR_LAYOUT.items():
+        pos = layout['pos']
+        dx, dy = layout['dir']
+        dist_cm = us_readings.get(key)
+        cv2.circle(img, pos, 4, (255, 255, 255), -1)
+
+        is_corner = key in ('CL', 'CR')
+        danger = is_corner and dist_cm is not None and dist_cm <= config.CORNER_DANGER_CM
+
+        if dist_cm is None:
+            line_color = (100, 100, 100)
+            text = f"{layout['label']}: -"
+            text_pos = (pos[0] + int(dx * 20) - (60 if dx < 0 else 0),
+                        pos[1] + int(dy * 20))
+        else:
+            clamped = min(dist_cm, _US_MAX_LINE_CM)
+            length_px = clamped * _US_SCALE_PX_PER_CM
+            end = (int(pos[0] + dx * length_px), int(pos[1] + dy * length_px))
+            line_color = (0, 0, 255) if danger else (0, 255, 0)
+            cv2.line(img, pos, end, line_color, 2)
+            cv2.circle(img, end, 4, line_color, -1)
+            warn = "  ⚠" if danger else ""
+            text = f"{layout['label']}: {dist_cm}cm{warn}"
+            text_pos = (end[0] + (5 if dx >= 0 else -110),
+                        end[1] - 10)
+
+        text_pos = (min(max(text_pos[0], 0), _US_CANVAS_W - 130),
+                    min(max(text_pos[1], 0), _US_CANVAS_H - 40))
+        img = put_text_kr(img, text, text_pos, 14, line_color if dist_cm is not None else (150, 150, 150))
+
+    # 평행 확인 요약 (우측 앞/뒤 차이)
+    rf, rr = us_readings.get('RF'), us_readings.get('RR')
+    if rf is not None and rr is not None:
+        diff = abs(rf - rr)
+        is_parallel = diff <= config.PARALLEL_DIFF_MARGIN_CM
+        summary = f"평행확인: 앞{rf}cm 뒤{rr}cm 차이{diff}cm {'(평행)' if is_parallel else '(비평행)'}"
+        summary_color = (0, 255, 0) if is_parallel else (0, 165, 255)
+    else:
+        summary = f"평행확인: 앞{rf if rf is not None else '-'}cm 뒤{rr if rr is not None else '-'}cm"
+        summary_color = (120, 120, 120)
+    img = put_text_kr(img, summary, (10, _US_CANVAS_H - 55), 15, summary_color)
+
+    # 모서리 위험 요약
+    cl, cr = us_readings.get('CL'), us_readings.get('CR')
+    cl_danger = cl is not None and cl <= config.CORNER_DANGER_CM
+    cr_danger = cr is not None and cr <= config.CORNER_DANGER_CM
+    corner_summary = f"모서리: 좌{cl if cl is not None else '-'}cm 우{cr if cr is not None else '-'}cm"
+    if cl_danger or cr_danger:
+        corner_summary += "  ⚠ 위험"
+        corner_color = (0, 0, 255)
+    else:
+        corner_color = (0, 255, 0) if (cl is not None or cr is not None) else (120, 120, 120)
+    img = put_text_kr(img, corner_summary, (10, _US_CANVAS_H - 30), 15, corner_color)
+
+    return img
+
+
+# ==========================================
+# [DEBUG] 상태 전환 판단: 단계별 수동 진행 모드 지원
+# ==========================================
+def should_advance(state_start, now, duration, key, step_label, config):
+    #값 바꿀떄 수동으로 단계변환
+    """
+    DEBUG_STEP_MODE=True  → 'n' 키를 눌러야 다음 상태로 전환. 누른 시점의
+                             경과 시간을 출력해 DURATION 값 확정에 사용.
+    DEBUG_STEP_MODE=False → 기존처럼 duration(초)이 지나면 자동 전환.
+    """
+    if config.DEBUG_STEP_MODE:
+        if key == ord('n'):
+            elapsed = now - state_start
+            print(f"[DEBUG-STEP] '{step_label}' 유지 시간: {elapsed:.2f}s "
+                  f"→ 이 값을 해당 DURATION으로 넣으면 됩니다.")
+            return True
+        return False
+    else:
+        return (now - state_start) >= duration
+
+
+def main():
+    arduino = fl.libARDUINO()
+    lidar_lib = fl.libLIDAR
+
+    ser = None
+    lidar_stream = None
+
+    try:
+        print("아두이노 연결 시도...")
+        try:
+            ser = arduino.init(Config.ARDUINO_PORT, Config.BAUD_RATE)
+        except Exception as e:
+            print(f"[DEBUG] 아두이노 연결 실패: {e}")
+            print_available_ports()
+            raise
+
+        print("라이다 스트림 시작...")
+        lidar_stream = LidarStream(lidar_lib, port=Config.LIDAR_PORT)
+        lidar_stream.start()
+        if not lidar_stream.started:
+            print("[DEBUG] 라이다 연결 실패로 보입니다.")
+            print_available_ports()
+
+        # 상태 표시용 창 (키 입력 수신에도 필요)
+        canvas = np.zeros((280, 560, 3), dtype=np.uint8) # 가변저항 디버그용 높이 확장
+        cv2.namedWindow('Parking Status')
+
+        # --- 상태 머신 변수 ---
+        state = 'IDLE'          # 현재 상태
+        state_start = 0.0       # 현재 상태 진입 시각
+        mission_start = 0.0     # 미션 시작 시각 (4분 제한 체크, 일시정지와 무관하게 실제 시간 그대로 흐름)
+        occ_streak = 0          # 우측 '있음' 연속 프레임 수
+        empty_streak = 0        # 우측 '없음' 연속 프레임 수
+        seen_first_car = False  # 첫 번째 주차 차량을 본 적 있는지
+
+        # 🌟 [FIX] 원본 주행코드의 is_driving 토글 컨벤션과 동일하게 맞춤
+        is_driving = False      # s로 토글: True면 상태머신 진행, False면 정지(S) 유지
+        pause_started_at = None # 일시정지에 들어간 시각 (재개 시 state_start 보정용)
+        current_angle_actual = None  # [DEBUG] 아두이노가 보내주는 실제 조향각 (아직 못 받으면 None)
+        us_readings = {'RF': None, 'RR': None, 'CL': None, 'CR': None}  # [PARK-US] 초음파 4개 최신값(cm)
+        adjust_count = 0        # [PARK-US] 삐딱함 교정을 위한 수정 기동 횟수를 누적하는 카운터
+
+        # [DEBUG] 가변저항 셋업 및 실시간 변수 초기화
+        calib_l = "-"
+        calib_r = "-"
+        cur_pot = "-"
+
+        print("=======================================")
+        print("주차 미션 대기 모드. [s] 시작/정지 토글 / [q] 종료")
+        print("상태 흐름: SCAN_FIRST → SCAN_GAP → ALIGN_FWD → LEFT_FWD")
+        print("        → REV_RIGHT_PREP → REV_RIGHT → REV_STRAIGHT → PARKED")
+        print("        → EXIT_FWD_PREP → EXIT_TURN → EXIT_STRAIGHT → DONE")
+        print("=======================================")
+
+        while True:
+            now = time.time()
+            key = cv2.waitKey(30) & 0xFF  # [DEBUG] 상단으로 이동: 이번 이터레이션의 상태 판단에도 사용
+
+            # [DEBUG/PARK-US] 아두이노 조향각, 초음파, 가변저항 데이터 일괄 읽기 (논블로킹)
+            current_angle_actual, us_readings, calib_l, calib_r, cur_pot = read_serial_data(
+                ser, current_angle_actual, us_readings, calib_l, calib_r, cur_pot)
+
+            # --- 라이다 우측면 판정 ---
+            occupied, n_pts, closest_angle, closest_dist, right_pts = False, 0, None, None, None
+            scan = lidar_stream.read()
+            if scan is not None:
+                try:
+                    occupied, n_pts, closest_angle, closest_dist, right_pts = right_side_occupied(
+                        lidar_stream.lidar, scan, Config)
+                except Exception as e:
+                    print(f"우측면 판정 예외: {e}")
+
+            # [DEBUG] 레이더 시각화 창 갱신 (전체 스캔 + 우측 감시구역 + 최근접 각도/거리 라벨)
+            cv2.imshow('Lidar Radar', draw_radar(scan, Config))
+            # [PARK-US] 초음파 4개 실시간 디버그 창 갱신
+            cv2.imshow('Ultrasonic Debug', draw_ultrasonic_debug(us_readings, Config))
+
+            # 디바운스 카운터 갱신
+            if occupied:
+                occ_streak += 1
+                empty_streak = 0
+            else:
+                empty_streak += 1
+                occ_streak = 0
+
+            # --- 미션 제한 시간 체크 (시작 이후에만) ---
+            if state not in ('IDLE', 'DONE') and (now - mission_start) > Config.MISSION_TIMEOUT:
+                print("[!] 미션 제한 시간(4분) 초과 → 정지")
+                send_cmd(ser, "S\n")
+                state = 'DONE'
+
+            # --- 상태 머신 ---
+            if not is_driving:
+                # 🚗 [수동 조종 모드] 시작 전(IDLE)일 때 i, k, j, l 키로 차를 직관적으로 복귀시킵니다.
+                if state == 'IDLE' and key in (ord('i'), ord('j'), ord('k'), ord('l')):
+                    if key == ord('i'):
+                        send_cmd(ser, f"A{Config.STEER_CENTER}\n")  # 일자 전진
+                    elif key == ord('k'):
+                        send_cmd(ser, f"B{Config.STEER_CENTER}\n")  # 일자 후진
+                    elif key == ord('j'):
+                        send_cmd(ser, f"A{Config.STEER_MIN}\n")     # 좌향 선회 전진
+                    elif key == ord('l'):
+                        send_cmd(ser, f"A{Config.STEER_MAX}\n")     # 우향 선회 전진
+                else:
+                    # 아무 키도 누르고 있지 않을 때는 즉시 제자리에 정차
+                    send_cmd(ser, "S\n")
+            elif state == 'IDLE':
+                send_cmd(ser, "S\n")
+
+            elif state == 'SCAN_FIRST':
+                # 직진 전진하며 첫 번째 주차 차량이 우측에 잡히길 기다림 (조향 모터 비활성화 쌩직진)
+                send_cmd(ser, "A0\n")
+                if occ_streak >= Config.DEBOUNCE_FRAMES:
+                    seen_first_car = True
+                    state = 'SCAN_GAP'
+                    state_start = now
+                    print(f"[1] 첫 차량 감지 (포인트 {n_pts}개) → 빈 칸 탐색 시작")
+
+            elif state == 'SCAN_GAP':
+                # 계속 전진하며 우측이 '비는' 순간(= 목표 주차 칸 시작)을 기다림 (조향 모터 비활성화 쌩직진)
+                send_cmd(ser, "A0\n")
+                if seen_first_car and empty_streak >= Config.DEBOUNCE_FRAMES:
+                    state = 'ALIGN_FWD'
+                    state_start = now
+                    print("[2] 빈 칸 감지! 정렬 전진 시작")
+
+            elif state == 'ALIGN_FWD':
+                # 차체가 칸을 살짝 지나치도록 추가 전진
+                send_cmd(ser, f"A{Config.STEER_CENTER}\n")
+                if should_advance(state_start, now, Config.ALIGN_FWD_DURATION, key, "ALIGN_FWD", Config):
+                    state = 'LEFT_FWD'
+                    state_start = now
+                    print("[3] 정렬 완료 → 좌로 꺾어 전진 시작")
+
+            elif state == 'LEFT_FWD':
+                # 좌로 꺾은 채 전진 → 후진 진입 각도 만들기
+                send_cmd(ser, f"A{Config.STEER_MIN}\n")
+                if should_advance(state_start, now, Config.LEFT_FWD_DURATION, key, "LEFT_FWD", Config):
+                    # 정차 명령과 함께 바퀴를 우측 최대로 미리 꺾음
+                    send_cmd(ser, f"A{Config.STEER_MAX}\n")
+                    send_cmd(ser, "S\n")
+                    state = 'REV_RIGHT_PREP'
+                    state_start = now
+                    print("[3.5] 진입각 완료 → 우로 꺾고 후진 대기")
+
+            elif state == 'REV_RIGHT_PREP':
+                # 정지 상태를 유지하여 서보 모터가 완전히 후진 조향 바퀴를 꺾을 시간을 제공합니다.
+                send_cmd(ser, "S\n")
+                if should_advance(state_start, now, Config.REV_RIGHT_PREP_DURATION, key, "REV_RIGHT_PREP", Config):
+                    state = 'REV_RIGHT'
+                    state_start = now
+                    print("[4] 후진 대기 완료 → 우로 꺾어 후진 진입")
+
+            elif state == 'REV_RIGHT':
+                # ⚠️ B 명령: 아두이노에 후진 처리가 추가되어 있어야 함
+                # 후진과 동시에 조향이 우측 목표로 이동함
+                send_cmd(ser, f"B{Config.STEER_MAX}\n")
+
+                # [NEW-SAFETY] 뒤 모서리(CL, CR) 충돌 위험 감시 및 긴급 회피
+                cl = us_readings.get('CL')
+                cr = us_readings.get('CR')
+                if cl is not None or cr is not None:
+                    val_cl = cl if cl is not None else 999
+                    val_cr = cr if cr is not None else 999
+                    if val_cl <= Config.CORNER_DANGER_CM or val_cr <= Config.CORNER_DANGER_CM:
+                        if adjust_count < Config.MAX_ADJUST_LIMIT:
+                            adjust_count += 1
+                            state = 'REV_STRAIGHT_ADJUST'
+                            state_start = now
+                            print(f"[4.2] 긴급! 뒤 모서리 충돌 위험 (CL:{cl}cm, CR:{cr}cm, 수정 {adjust_count}회차) → 회피 전진 시작")
+                            continue
+                        else:
+                            # 수정 한도를 다 썼다면 충돌 전에 그 자리에서 비상 정차 완료
+                            state = 'PARKED'
+                            state_start = now
+                            send_cmd(ser, "S\n")
+                            print(f"[4.3] 위험! 뒤 모서리 충돌 한계 도달 (수정 {adjust_count}회 한도 소진) → 즉각 비상 정차")
+                            continue
+
+                if should_advance(state_start, now, Config.REV_RIGHT_DURATION, key, "REV_RIGHT", Config):
+                    state = 'REV_STRAIGHT'
+                    state_start = now
+                    print("[5] 핸들 중앙, 직진 후진")
+
+            elif state == 'REV_STRAIGHT':
+                send_cmd(ser, f"B{Config.STEER_CENTER}\n")
+
+                # [NEW-SAFETY] 뒤 모서리(CL, CR) 충돌 위험 감시 및 긴급 회피
+                cl = us_readings.get('CL')
+                cr = us_readings.get('CR')
+                if cl is not None or cr is not None:
+                    val_cl = cl if cl is not None else 999
+                    val_cr = cr if cr is not None else 999
+                    if val_cl <= Config.CORNER_DANGER_CM or val_cr <= Config.CORNER_DANGER_CM:
+                        if adjust_count < Config.MAX_ADJUST_LIMIT:
+                            adjust_count += 1
+                            # [NEW-SAFETY] 기어 역전 보호: 모터 정지 명령 후 물리 대기
+                            send_cmd(ser, "S\n")
+                            time.sleep(Config.GEAR_REVERSE_DELAY)
+                            state = 'REV_STRAIGHT_ADJUST'
+                            state_start = now
+                            print(f"[5.1] 긴급! 뒤 모서리 충돌 위험 (CL:{cl}cm, CR:{cr}cm, 수정 {adjust_count}회차) → 회피 전진 시작")
+                            continue
+                        else:
+                            # 수정 한도를 다 썼다면 충돌 전에 그 자리에서 비상 정차 완료
+                            state = 'PARKED'
+                            state_start = now
+                            send_cmd(ser, "S\n")
+                            print(f"[5.12] 위험! 뒤 모서리 충돌 한계 도달 (수정 {adjust_count}회 한도 소진) → 즉각 비상 정차")
+                            continue
+
+                # [FIX] 수정 주차를 반복할수록 누적되어 뒤로 밀려나는 현상 방지
+                # - 최초 후진(adjust_count=0) 시에는 주차 칸 안으로 깊게 진입하도록 REV_STRAIGHT_DURATION(1.5초) 적용
+                # - 수정 재후진(adjust_count>0) 시에는 전진했던 시간만큼만 제자리 복귀하도록 PARK_ADJUST_FWD_DURATION(1.2초) 동적 적용
+                curr_duration = Config.REV_STRAIGHT_DURATION if adjust_count == 0 else Config.PARK_ADJUST_FWD_DURATION
+
+                # [NEW] 라이다 기반 후진 자동정지 판단
+                # 후진을 시작한 지 0.5초가 지난 후부터 좌우 양옆에 차량이 감지되는지 검사합니다.
+                stop_by_lidar = False
+                if (now - state_start) >= Config.REV_STRAIGHT_SAFE_TIME:
+                    if should_stop_by_lidar_both_sides(scan, Config):
+                        print("[5.15] 라이다 좌우 양옆 차량 포착! 골인 정지 트리거 발생")
+                        stop_by_lidar = True
+
+                # 안전 타이머(curr_duration)가 다 찼거나, 라이다 자동정지 조건이 만족되면 정지 및 다음 판단으로 전환
+                if stop_by_lidar or should_advance(state_start, now, curr_duration, key, "REV_STRAIGHT", Config):
+                    # 일자 후진 완료 직전 평행 오차 및 우측 거리를 확인합니다.
+                    rf = us_readings.get('RF')
+                    rr = us_readings.get('RR')
+                    if rf is not None and rr is not None and adjust_count < Config.MAX_ADJUST_LIMIT:
+                        is_crooked = abs(rf - rr) > Config.PARALLEL_DIFF_MARGIN_CM
+                        avg_dist = (rf + rr) / 2.0
+                        is_out_of_range = abs(avg_dist - Config.DESIRED_WALL_DIST_CM) > Config.DESIRED_WALL_DIST_MARGIN_CM  # 35cm 기준 허용 오차 마진 초과 여부
+                        
+                        if is_crooked or is_out_of_range:
+                            adjust_count += 1
+                            # [NEW-SAFETY] 기어 역전 보호: 모터 정지 명령 후 물리 대기
+                            send_cmd(ser, "S\n")
+                            time.sleep(Config.GEAR_REVERSE_DELAY)
+                            state = 'REV_STRAIGHT_ADJUST'
+                            state_start = now
+                            print(f"[5.2] 재정렬 기동 개시 (평행오차:{abs(rf-rr):.1f}cm, 거리오차:{abs(avg_dist - Config.DESIRED_WALL_DIST_CM):.1f}cm, 수정 {adjust_count}회차)")
+                            continue
+
+                    # 합격 시 혹은 수정 한도 도달 시 주차 완료
+                    state = 'PARKED'
+                    state_start = now
+                    send_cmd(ser, "S\n")
+                    print("[6] 주차 완료. 4초 정차 (규칙 3~5초)")
+
+            elif state == 'REV_STRAIGHT_ADJUST':
+                # 평행 보정 및 우측 35cm 거리 유지 제어를 함께 반영해 전진합니다.
+                steer = get_wall_following_steer(us_readings, Config)
+                send_cmd(ser, f"A{steer}\n")
+                if should_advance(state_start, now, Config.PARK_ADJUST_FWD_DURATION, key, "REV_STRAIGHT_ADJUST", Config):
+                    # 재후진 전 모터를 정지하고 조향은 똑바로 펴줍니다.
+                    send_cmd(ser, f"A{Config.STEER_CENTER}\n")
+                    send_cmd(ser, "S\n")
+                    state = 'REV_STRAIGHT_PREP'
+                    state_start = now
+                    print("[5.4] 교정 전진 완료 → 재후진 전 정지 대기")
+
+            elif state == 'REV_STRAIGHT_PREP':
+                # 정지 상태를 대기하며 기어 역전 충격을 방지합니다.
+                send_cmd(ser, "S\n")
+                if should_advance(state_start, now, Config.REV_STRAIGHT_PREP_DURATION, key, "REV_STRAIGHT_PREP", Config):
+                    state = 'REV_STRAIGHT'
+                    state_start = now
+                    print("[5.6] 정지 대기 완료 → 재후진(정렬) 시작")
+
+            elif state == 'PARKED':
+                send_cmd(ser, "S\n")
+                # PARKED는 규칙상 3~5초 고정 정차이므로 단계 모드에서도 시간 기반 유지
+                if (now - state_start) >= Config.PARKED_WAIT:
+                    state = 'EXIT_FWD_PREP'
+                    state_start = now
+                    print("[6.5] 정차 해제 → 출차 직진 전진 시작")
+
+            elif state == 'EXIT_FWD_PREP':
+                # 핸들을 똑바로 정렬하고 전진 살짝
+                send_cmd(ser, f"A{Config.STEER_CENTER}\n")
+                if should_advance(state_start, now, Config.EXIT_FWD_PREP_DURATION, key, "EXIT_FWD_PREP", Config):
+                    state = 'EXIT_TURN'
+                    state_start = now
+                    print("[7] 출차 준비 완료 → 전진 + 우회전 탈출")
+
+            elif state == 'EXIT_TURN':
+                # 후진 주차했으므로 차 머리는 통로 쪽 → 전진하며 우로 꺾어 OUT 방향으로
+                send_cmd(ser, f"A{Config.STEER_MAX}\n")
+                if should_advance(state_start, now, Config.EXIT_TURN_DURATION, key, "EXIT_TURN", Config):
+                    state = 'EXIT_STRAIGHT'
+                    state_start = now
+                    print("[8] OUT 방향 직진")
+
+            elif state == 'EXIT_STRAIGHT':
+                send_cmd(ser, f"A{Config.STEER_CENTER}\n")
+                if should_advance(state_start, now, Config.EXIT_STRAIGHT_DURATION, key, "EXIT_STRAIGHT", Config):
+                    state = 'DONE'
+                    send_cmd(ser, "S\n")
+                    print("[9] 미션 종료 (OUT 라인 통과 목표). 정지.")
+
+            elif state == 'DONE':
+                send_cmd(ser, "S\n")
+
+            # --- 상태 표시 ---
+            canvas[:] = 0
+            elapsed = (now - mission_start) if state not in ('IDLE',) and mission_start > 0 else 0.0
+            label, motion, color = STATE_INFO.get(state, (state, "-", (255, 255, 255)))
+            canvas = put_text_kr(canvas, f"[{state}] {label}", (10, 12), 22, (255, 255, 255))
+            canvas = put_text_kr(canvas, motion, (10, 45), 32, color)
+
+            # [DEBUG] 실시간 가변저항 디버그 정보 그리기 (화면 하단에 추가)
+            canvas = put_text_kr(canvas, f"L Pot: {calib_l} | R Pot: {calib_r} | Cur Pot: {cur_pot}", 
+                                  (10, 230), 16, (180, 255, 180))
+
+            # [NEW] 실시간 목표 조향각 및 아두이노 실제 피드백 조향각 오버레이
+            target_ang = TARGET_ANGLE_BY_STATE.get(state, "-")
+            if state == 'REV_STRAIGHT_ADJUST':
+                target_ang = get_wall_following_steer(us_readings, Config)
+            ang_actual = current_angle_actual if current_angle_actual is not None else "-"
+            canvas = put_text_kr(canvas, f"Target Steer: {target_ang}° | Actual: {ang_actual}°",
+                                  (10, 85), 16, (0, 200, 255))
+
+            canvas = put_text_kr(canvas, f"Right pts: {n_pts}  occ:{occ_streak} emp:{empty_streak}",
+                                  (10, 110), 18, (0, 255, 255))
+            # [DEBUG] 가까운 순 상위 3개 포인트 표시 (각도/거리 다양하게 확인용)
+            if right_pts is not None and len(right_pts) > 0:
+                order = np.argsort(right_pts[:, 1])[:3]
+                top_line = "  ".join(
+                    f"{right_pts[i, 0]:.0f}°/{right_pts[i, 1]:.0f}mm" for i in order
+                )
+                lidar_line = f"근접 top3: {top_line}"
+                lidar_color = (0, 255, 255)
+            else:
+                lidar_line = "근접 top3: 감지 없음"
+                lidar_color = (120, 120, 120)
+            canvas = put_text_kr(canvas, lidar_line, (10, 138), 18, lidar_color)
+            canvas = put_text_kr(canvas, f"Mission time: {elapsed:.1f}s / {Config.MISSION_TIMEOUT:.0f}s",
+                                  (10, 168), 20, (255, 255, 255))
+            step_hint = "  [n] next step" if Config.DEBUG_STEP_MODE else ""
+            s_hint = "[s] start" if state == 'IDLE' else "[s] pause/resume"
+            pause_tag = "  ⏸ PAUSED" if (state not in ('IDLE', 'DONE') and not is_driving) else ""
+            canvas = put_text_kr(canvas, f"{s_hint}  [q] quit{step_hint}{pause_tag}",
+                                  (10, 200), 18, (200, 200, 200))
+            cv2.imshow('Parking Status', canvas)
+
+            # [DEBUG] key는 루프 상단에서 이미 읽음 (waitKey 중복 호출 제거)
+            if key == ord('q'):
+                print("프로그램 종료.")
+                break
+            elif key == ord('s'):
+                if state == 'IDLE':
+                    # 최초 시작
+                    is_driving = True
+                    state = 'SCAN_FIRST'
+                    mission_start = now
+                    state_start = now
+                    occ_streak = 0
+                    empty_streak = 0
+                    seen_first_car = False
+                    adjust_count = 0  # 수정 기동 횟수 카운터 리셋
+                    print("==== 🚗 주차 미션 시작! ====")
+                elif state != 'DONE':
+                    # 🌟 [FIX] 원본 주행코드처럼 토글: 미션 진행 중 s를 또 누르면 정지/재개
+                    is_driving = not is_driving
+                    if not is_driving:
+                        pause_started_at = now
+                        print("==== ⏸ 일시정지 (정지 명령 유지) ====")
+                    else:
+                        if pause_started_at is not None:
+                            # 정지해 있던 시간만큼 이 상태의 지속시간 판단 기준을 뒤로 밀어줌
+                            # (미션 전체 제한시간(mission_start)은 보정하지 않음 — 실제 경기 시계는 계속 흐름)
+                            paused_for = now - pause_started_at
+                            state_start += paused_for
+                            pause_started_at = None
+                        print("==== ▶ 재개 ====")
+
+    except KeyboardInterrupt:
+        print("\n사용자 강제 종료.")
+    except Exception as e:
+        print(f"\n에러 발생: {e}")
+    finally:
+        print("안전 종료 절차...")
+        if ser is not None and ser.is_open:
+            try:
+                ser.write(b'S\n')
+                time.sleep(0.1)
+                ser.close()
+                print("아두이노q 포트 닫힘.")
+            except Exception as e:
+                print(f"아두이노 종료 에러: {e}")
+        if lidar_stream is not None:
+            lidar_stream.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
