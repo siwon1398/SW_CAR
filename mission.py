@@ -16,10 +16,10 @@ class Config:
     MODEL_MISSION_PATH = "best_object.pt" # 🆕 미션용 가중치 파일명
 
     # 🌟 미션 객체 인식 클래스 ID (best_object.pt 맞춤 설정)
-    CLASS_CAR = 0
-    CLASS_RED_LIGHT = 3
-    CLASS_GREEN_LIGHT = 1 
-    CLASS_LANE = 2         # 모델의 'lane' (정지선이나 차선 인식용)
+    
+    CLASS_RED_LIGHT = 2
+    CLASS_GREEN_LIGHT = 0 
+    CLASS_LANE = 1        # 모델의 'lane' (정지선이나 차선 인식용)
 
     # 🌟 정지선 감지 ROI 설정 (y 좌표 기준: 화면의 어느 지점에 선이 와야 멈출지)
     # [조정됨] 늦게 멈추는 현상을 해결하기 위해 멈춤 기준선을 위로 올렸습니다. (숫자가 작을수록 일찍 멈춤)
@@ -75,29 +75,29 @@ class Config:
     # ------------------------------------------
     # 🚦 라이다(LiDAR) 미션 변수
     # ------------------------------------------
-    LIDAR_MIN_ANGLE = 165 # 정면(180도) 기준 왼쪽 한계
-    LIDAR_MAX_ANGLE = 195 # 정면(180도) 기준 오른쪽 한계 (총 40도 범위)
+    LIDAR_MIN_ANGLE = 170 # 정면(180도) 기준 왼쪽 한계
+    LIDAR_MAX_ANGLE = 190 # 정면(180도) 기준 오른쪽 한계 (총 40도 범위)
     LIDAR_MIN_DIST = 500  # 너무 가까운 노이즈 무시
     LIDAR_MAX_DIST = 1700 # 1.3m 앞 장애물 회피 시작 (YOLO와 함께 감지될 때)
-    LIDAR_EMERGENCY_DIST = 1600 # 0.8m 이내면 YOLO 무시하고 즉각 회피!
+    LIDAR_EMERGENCY_DIST = 1500 # 0.8m 이내면 YOLO 무시하고 즉각 회피!
 
     # ------------------------------------------
     # 🚗 차선 변경 (비전 하이브리드) 미션 변수
     # ------------------------------------------
-    LANE_SWITCH_COOLDOWN = 2.5
+    LANE_SWITCH_COOLDOWN = 3.0
     LANE_SWITCH_MAX_DUR = 5.0          # 차선 변경 전체 최대 타임아웃
     
     # 🌟 1차 회피 시간 (우 -> 좌)
-    PHASE1_DUR_1ST = 1.4                   # Phase 1 (진입) 유지 시간 (초) - 너무 많이 가면 줄이세요
+    PHASE1_DUR_1ST = 1.43                  # Phase 1 (진입) 유지 시간 (초) - 너무 많이 가면 줄이세요
     PHASE2_DUR_1ST = 1.2                   # Phase 2 (카운터 스티어) 유지 시간 (초)
 
     # 🌟 2차 복귀 시간 (좌 -> 우) - 첫 번째보다 0.2초씩 줄여서 설정
-    PHASE1_DUR_2ND = 1.2
+    PHASE1_DUR_2ND = 1.6
     PHASE2_DUR_2ND = 1.2
     FORCED_STEER_ANGLE = 40 
     
     # 🌟 초기 조향 보정 계수 (1도 쏠림당 가감할 시간) ex)40*0.005 = 0.2초
-    DYNAMIC_TIME_COEF = 0.004
+    DYNAMIC_TIME_COEF = 0.005
 
 # 전역 변수: 최신 라이다 스캔 데이터 저장
 latest_lidar_scan = np.array([])
@@ -451,7 +451,6 @@ def main():
             # ----------------------------------------------------
             # 🆕 YOLO 기반 미션 객체 탐지 (신호등, 자동차, 정지선)
             # ----------------------------------------------------
-            car_detected = False
             stop_line_in_roi = False
         
             frame_count += 1
@@ -499,9 +498,7 @@ def main():
                         cls_id = int(box.cls[0])
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                     
-                        if cls_id == Config.CLASS_CAR:
-                            car_detected = True
-                        elif cls_id == Config.CLASS_LANE:
+                        if cls_id == Config.CLASS_LANE:
                             if y2 >= Config.STOP_LINE_Y_MAX:
                                 # [핵심 로직] 박스의 세로 두께(y2 - y1)를 측정하여 진짜 횡단보도 정지선인지 구별
                                 line_thickness = y2 - y1
@@ -615,7 +612,7 @@ def main():
                 # 2회 변경 완료(신호등 진입) 이후에는 어떠한 경우에도 추가 차선 변경(3회째)을 완벽 차단!
                 fusion_obstacle_condition = False
 
-            if fusion_obstacle_condition and (current_time - last_switch_time > Config.LANE_SWITCH_COOLDOWN):
+            if fusion_obstacle_condition and (current_time - last_switch_time > Config.LANE_SWITCH_COOLDOWN) and lane_change_phase == 0:
                 lane_state = "LEFT" if lane_state == "RIGHT" else "RIGHT"
                 last_switch_time = current_time
                 lane_change_phase = 1
@@ -706,10 +703,7 @@ def main():
                 for box in last_results_f0_boxes:
                     cls_id = int(box.cls[0])
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    if cls_id == Config.CLASS_CAR:
-                        cv2.rectangle(frame0, (x1, y1), (x2, y2), (255, 0, 255), 2)
-                        cv2.putText(frame0, "CAR", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-                    elif cls_id == Config.CLASS_LANE:
+                    if cls_id == Config.CLASS_LANE:
                         cv2.rectangle(frame0, (x1, y1), (x2, y2), (255, 255, 0), 2)
                         cv2.putText(frame0, "LANE (STOP)", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                     
